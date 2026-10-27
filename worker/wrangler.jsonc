@@ -1,0 +1,27 @@
+// Duet Bridge: a cloud mailbox between Claude Duet and Claude Code on your Mac.
+// Secrets (set with `wrangler secret put`, never in this file):
+//   OWNER_PASSPHRASE  the passphrase on the sign-in page
+//   BRIDGE_TOKEN      the bearer token the Mac checker sends to /bridge/*
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "duet-bridge",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  // CIMD lookups (Claude Code signs in with a Client ID Metadata Document) must only reach public hosts.
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "workers_dev": true,
+  "vars": {
+    // The exact public URL of this Worker, with no trailing slash. Set it after the first deploy.
+    "PUBLIC_URL": "https://duet-bridge.example.workers.dev",
+    // Workspaces a job may name. The Mac maps each name to a folder in config.toml.
+    "WORKSPACES": "default"
+  },
+  "kv_namespaces": [
+    { "binding": "OAUTH_KV" }
+  ],
+  "durable_objects": {
+    "bindings": [{ "name": "MAILBOX", "class_name": "Mailbox" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Mailbox"] }],
+  "observability": { "enabled": true }
+}

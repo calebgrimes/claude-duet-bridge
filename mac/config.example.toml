@@ -1,0 +1,37 @@
+# Duet Bridge checker settings. Copy this file to config.toml (setup.sh does it for you).
+# config.toml is gitignored: it holds your folder paths.
+
+url = ""                               # the Worker URL, no trailing slash. setup.sh fills it in. Empty = poll does nothing.
+token_file = "~/.duet-bridge-token"    # bearer token the Mac sends to the Worker. setup.sh makes it.
+log_file = "~/Library/Logs/duet-bridge.log"
+model = "opus"
+timeout_secs = 1800                    # one job may run this long
+max_jobs_per_run = 3                   # jobs taken per check, so one check never runs for hours
+
+# Tools a job may use. Everything else is refused (--permission-mode dontAsk).
+# Add read-only MCP tools by full name ("mcp__calendar__list_events") or a whole server ("mcp__calendar").
+allowed_tools = ["Read", "Glob", "Grep"]
+
+# Tools that are refused even when allowed_tools would allow them. If you leave this out,
+# duet-bridge.py uses DEFAULT_DENIED: no shell, no edits, no web, no sub-agents, no scheduling,
+# no messages to other sessions, and no reads of dotfiles. If you set it, you replace that list.
+# denied_tools = [...]
+
+# Names a Duet job may give, and the folder each one runs in.
+# The names must match WORKSPACES in worker/wrangler.jsonc.
+[workspaces]
+default = "~/Documents"
+
+# The ONLY MCP servers a job loads (--strict-mcp-config). Leave out anything that can send or write.
+# A local server:
+# [mcp_servers.calendar]
+# command = "~/mcp/calendar/.venv/bin/python"
+# args = ["~/mcp/calendar/server.py"]
+# A remote server:
+# [mcp_servers.docs]
+# url = "https://example.com/mcp"
+
+# Extra environment variables for each job, for example a flag your own hooks read
+# to stay quiet in unattended runs.
+[job_env]
+# MY_HOOKS_HEADLESS = "1"
