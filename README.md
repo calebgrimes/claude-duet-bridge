@@ -1,5 +1,7 @@
 # Duet Bridge: connect Claude Duet to Claude Code (MCP connector)
 
+[![calebgrimes/claude-duet-bridge MCP server](https://glama.ai/mcp/servers/calebgrimes/claude-duet-bridge/badges/score.svg)](https://glama.ai/mcp/servers/calebgrimes/claude-duet-bridge)
+
 **Duet Bridge is a custom MCP connector that lets Claude Duet talk to Claude Code on your Mac, in both directions.** Duet can send work to Claude Code, start new Claude Code sessions, talk with a terminal window you have open, and open a session on your screen. Claude Code can answer Duet and send it messages first.
 
 It is a remote MCP server on Cloudflare Workers (free plan), with OAuth sign-in for claude.ai, plus a small runner and a [Claude Code channel](https://docs.claude.com/en/docs/claude-code/channels) on the Mac.
