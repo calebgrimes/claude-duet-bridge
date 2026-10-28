@@ -1,0 +1,10 @@
+{
+  "name": "duet-channel",
+  "version": "2.0.0",
+  "description": "Claude Code channel: a live line from one Code window to Claude Duet through Duet Bridge",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.20.0"
+  }
+}

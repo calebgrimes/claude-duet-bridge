@@ -1,0 +1,69 @@
+#!/bin/bash
+# duet-code: start Claude Code with a live line to Claude Duet. Type it in place of `claude`.
+#   duet-code                         a new window that Duet can see and talk to
+#   duet-code --name "Weekly review"  the same, with the name Duet sees
+#   duet-code --session <id> ...      take over a Duet session (open_on_mac runs this)
+#   duet-code --dir <folder> ...      start in that folder
+# Any other arguments go to `claude` unchanged.
+# Settings: url and token_file in config.toml next to this script. You can link this file
+# into your PATH, for example: ln -sf /path/to/mac/duet-code ~/.local/bin/duet-code
+# The first launch shows a warning screen about development channels. Choose
+# "I am using this for local development". The channel is built in this repo, not an outside download.
+set -euo pipefail
+
+# Find the real folder of this script, also when it is run through a symlink.
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do
+  DIR="$(cd "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  case "$SELF" in /*) ;; *) SELF="$DIR/$SELF" ;; esac
+done
+HERE="$(cd "$(dirname "$SELF")" && pwd)"
+
+NAME="" SESSION=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --name) NAME="$2"; shift 2 ;;
+    --session) SESSION="$2"; shift 2 ;;
+    --dir) cd "$2"; shift 2 ;;
+    *) break ;;
+  esac
+done
+
+CONFIG="${DUET_BRIDGE_CONFIG:-$HERE/config.toml}"
+[ -f "$CONFIG" ] || { echo "✖ $CONFIG not found. Copy config.example.toml to config.toml first."; exit 1; }
+# Read one top-level value (before the first [section]) from config.toml.
+conf() { sed -n "/^\[/q; s/^$1 *= *\"\([^\"]*\)\".*/\1/p" "$CONFIG" | head -1; }
+URL="${DUET_BRIDGE_URL:-$(conf url)}"
+TOKEN_FILE="${DUET_BRIDGE_TOKEN_FILE:-$(conf token_file)}"
+TOKEN_FILE="${TOKEN_FILE:-$HOME/.duet-bridge-token}"
+case "$TOKEN_FILE" in "~"*) TOKEN_FILE="$HOME${TOKEN_FILE#\~}" ;; esac
+[ -n "$URL" ] || { echo "✖ url is empty in $CONFIG, so the bridge is not set up."; exit 1; }
+NODE="$(command -v node)" || { echo "✖ node is not on PATH."; exit 1; }
+CHANNEL_DIR="$(cd "$HERE/../channel" && pwd)"
+CHANNEL="$CHANNEL_DIR/channel.mjs"
+[ -d "$CHANNEL_DIR/node_modules" ] || (cd "$CHANNEL_DIR" && npm install --silent)
+
+# The server definition and the Stop hook live in private temp files, so no global Claude config changes.
+# The Stop hook sends a window back once if it answered a Duet message in the terminal only.
+CFG="$(mktemp -t duet-channel).json"
+SETTINGS="$(mktemp -t duet-settings).json"
+python3 - "$CFG" "$SETTINGS" "$NODE" "$CHANNEL" "$URL" "$TOKEN_FILE" "$SESSION" "$NAME" <<'EOF'
+import json, os, shlex, sys
+cfg, settings, node, channel, url, token_file, session, name = sys.argv[1:]
+# A background copy of the window reads the same file, so it finds the same lock and stays quiet.
+env = {"DUET_BRIDGE_URL": url, "DUET_BRIDGE_TOKEN_FILE": token_file, "DUET_LOCK_FILE": cfg + ".lock"}
+if session: env["DUET_SESSION_ID"] = session
+if name: env["DUET_SESSION_NAME"] = name
+json.dump({"mcpServers": {"duet": {"type": "stdio", "command": node, "args": [channel], "env": env}}}, open(cfg, "w"))
+hook = shlex.join([node, os.path.join(os.path.dirname(channel), "stop-hook.mjs")])
+# Remote Control off: with it on, Claude Code can move Duet windows into its background service
+# about 30 s after a turn, and the moved session drops the channel flag, so Duet's messages go nowhere.
+json.dump({"remoteControlAtStartup": False,
+           "hooks": {"Stop": [{"hooks": [{"type": "command", "command": hook}]}]}}, open(settings, "w"))
+EOF
+
+# The two Duet tools are pre-approved: a reply goes only to your own Duet.
+exec claude --mcp-config "$CFG" --settings "$SETTINGS" \
+  --allowedTools "mcp__duet__send_to_duet,mcp__duet__set_focus" \
+  --dangerously-load-development-channels server:duet ${NAME:+--name "$NAME"} "$@"
