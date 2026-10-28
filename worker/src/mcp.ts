@@ -4,13 +4,17 @@ import type { Env } from "./index";
 import type { JobStatus, Mailbox } from "./mailbox";
 
 const SUPPORTED_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26"];
-const SERVER_INFO = { name: "duet-bridge", title: "Duet Bridge", version: "1.0.0" };
+const SERVER_INFO = { name: "duet-bridge", title: "Duet Bridge", version: "2.0.0" };
 
-const INSTRUCTIONS = `Duet Bridge is a mailbox between you and Claude Code on the owner's Mac.
-- To ask Claude Code to do work on the Mac, call send_job. The Mac checks the mailbox about every 5 minutes, so results are not instant. Call get_job later to read the result.
-- Jobs on the Mac are read-only: Claude Code can read files in the job's workspace folder and use the read-only tools the owner allowed, and it answers in text. It cannot send email, edit files or run commands.
-- Claude Code leaves you reports with post_report. Call read_reports to collect them.
-- Call bridge_status to see when the Mac last checked in. If that is more than 15 minutes ago, the Mac is probably asleep, so tell the owner the job will wait.`;
+const INSTRUCTIONS = `Duet Bridge connects you to Claude Code on the user's Mac. You talk to Claude Code in sessions.
+- list_sessions shows every session. A "live" session is a Code window the user has open; connected=true means it hears you within seconds. A "headless" session is a background conversation the Mac runs for you.
+- To pass work to Claude Code, call start_session with a complete brief. Claude Code sees only your text, not this chat. Use mode "read" (the default) to look things up and draft answers. Use mode "work" only when the job must edit files or run commands, and only when the user asked for that.
+- To continue any session, live or headless, call send_message. Give wait_seconds (up to 45) to get the answer in the same call. If it is not back yet, call read_messages later with that session_id.
+- Claude Code can also message you first. Call read_messages with no session_id at the start of a conversation and on each background check, and tell the user what is there.
+- open_on_mac shows a headless session in a terminal window on the Mac, so the user can take over by hand. end_session closes a session you no longer need.
+- Nothing Claude Code does sends email or messages for the user. It stages drafts for the user to review.
+- bridge_status shows when the Mac last checked in. If that is more than 2 minutes ago, the Mac is probably asleep or offline, so tell the user the work will wait.
+- send_job, get_job, list_jobs and cancel_job are the older one-shot path. Prefer sessions.`;
 
 const STATUSES = ["queued", "running", "done", "failed", "cancelled"];
 
@@ -20,7 +24,7 @@ function tools(workspaces: string[]) {
       name: "send_job",
       title: "Send a job to Claude Code",
       description:
-        "Queue a read-only job for Claude Code on the owner's Mac. Write the instructions as a complete brief: Claude Code sees only this text. Returns a job id. The Mac picks jobs up about every 5 minutes.",
+        "Queue a read-only job for Claude Code on the user's Mac. Write the instructions as a complete brief: Claude Code sees only this text. Returns a job id. The Mac picks jobs up within seconds while it is awake.",
       inputSchema: {
         type: "object",
         properties: {
@@ -106,12 +110,114 @@ function tools(workspaces: string[]) {
     {
       name: "bridge_status",
       title: "Bridge status",
-      description: "Job counts, unread reports, and when the Mac last checked the mailbox.",
+      description: "Job counts, unread messages and reports, open live windows, and when the Mac last checked in.",
       inputSchema: { type: "object", properties: {}, additionalProperties: false },
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
+    {
+      name: "list_sessions",
+      title: "List Claude Code sessions",
+      description:
+        "List Claude Code sessions, newest activity first: live windows the user has open (connected=true means it hears you now) and headless sessions the Mac runs. Shows each one's name, folder, focus and status.",
+      inputSchema: {
+        type: "object",
+        properties: { include_ended: { type: "boolean", default: false } },
+        additionalProperties: false,
+      },
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    {
+      name: "start_session",
+      title: "Start a Claude Code session",
+      description:
+        "Start a new background Claude Code conversation on the user's Mac and send it the first message. Write a complete brief: Claude Code sees only this text. Continue it later with send_message.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "A short name, for example 'Weekly review prep'." },
+          message: { type: "string", description: "The full first message: what to do and what the answer should look like." },
+          workspace: { type: "string", enum: workspaces, default: workspaces[0], description: "Which project folder on the Mac the session runs in." },
+          mode: {
+            type: "string", enum: ["read", "work"], default: "read",
+            description: "read: look things up and answer in text. work: may also edit files and run commands, with the user's own Claude Code safety rules on. Use work only when the user asked for changes.",
+          },
+          wait_seconds: { type: "integer", minimum: 0, maximum: 45, default: 0, description: "Hold the call this long for the first answer." },
+        },
+        required: ["name", "message"],
+        additionalProperties: false,
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    },
+    {
+      name: "send_message",
+      title: "Message a Claude Code session",
+      description:
+        "Send a message to a Claude Code session, live or headless. A connected live window gets it within seconds. A headless session answers in its next turn. Give wait_seconds to get the answer in this call.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          session_id: { type: "string", description: "The id from list_sessions or start_session." },
+          text: { type: "string", description: "The message." },
+          wait_seconds: { type: "integer", minimum: 0, maximum: 45, default: 0 },
+        },
+        required: ["session_id", "text"],
+        additionalProperties: false,
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    },
+    {
+      name: "read_messages",
+      title: "Read messages from Claude Code",
+      description:
+        "Read unread messages that Claude Code sent you, oldest first, and mark them read. Give a session_id for one session, or none for everything, including messages Claude Code sent outside any session.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          session_id: { type: "string" },
+          wait_seconds: { type: "integer", minimum: 0, maximum: 45, default: 0, description: "If nothing is there yet, wait this long for a message." },
+          limit: { type: "integer", minimum: 1, maximum: 50, default: 20 },
+        },
+        additionalProperties: false,
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    },
+    {
+      name: "end_session",
+      title: "End a session",
+      description: "Close a session. A headless session stops taking turns; a live window disconnects from Duet but stays open on the Mac.",
+      inputSchema: {
+        type: "object",
+        properties: { session_id: { type: "string" } },
+        required: ["session_id"],
+        additionalProperties: false,
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    {
+      name: "open_on_mac",
+      title: "Open a session on the Mac",
+      description:
+        "Open a headless session in a terminal window on the user's Mac, so the user can read it and take over by hand. The window then becomes a live session.",
+      inputSchema: {
+        type: "object",
+        properties: { session_id: { type: "string" } },
+        required: ["session_id"],
+        additionalProperties: false,
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    },
   ];
 }
+
+function wait(args: Record<string, unknown>): number {
+  const v = args.wait_seconds;
+  if (v === undefined) return 0;
+  if (typeof v !== "number" || !Number.isInteger(v) || v < 0) throw new ToolError("'wait_seconds' must be a whole number from 0.");
+  return Math.min(v, 45) * 1000;
+}
+
+// What a session looks like to Duet: no internal ids it cannot use.
+const view = <T extends { claude_id?: unknown; busy_since?: unknown }>({ claude_id, busy_since, ...rest }: T) => rest;
 
 class ToolError extends Error {}
 
@@ -179,6 +285,56 @@ async function callTool(env: Env, name: string, args: Record<string, unknown>) {
     }
     case "bridge_status":
       return text(await box.status());
+    case "list_sessions": {
+      const rows = await box.listSessions(bool(args, "include_ended", false), 50);
+      return text(rows.length ? rows.map(view) : "No sessions. Start one with start_session, or ask the user to open a window with duet-code.");
+    }
+    case "start_session": {
+      const workspace = str(args, "workspace", false) || workspaces[0];
+      if (!workspaces.includes(workspace)) throw new ToolError(`Unknown workspace '${workspace}'. Use one of: ${workspaces.join(", ")}.`);
+      const mode = str(args, "mode", false) || "read";
+      if (mode !== "read" && mode !== "work") throw new ToolError("'mode' must be read or work.");
+      const ms = wait(args);
+      const { session } = await box.startHeadless(str(args, "name"), workspace, mode, str(args, "message"));
+      const replies = ms ? await box.waitForDuet(session.id, ms, true, 20) : [];
+      return text({ session: view(session), replies, note: replies.length ? undefined : "The Mac will answer in its next turn. Call read_messages with this session_id." });
+    }
+    case "send_message": {
+      const id = str(args, "session_id");
+      const s = await box.getSession(id);
+      if (!s) throw new ToolError("No session has that id. Call list_sessions.");
+      if (s.status === "ended") throw new ToolError("That session has ended. Start a new one with start_session.");
+      const ms = wait(args);
+      const m = await box.sendToCode(id, str(args, "text"));
+      const replies = ms ? await box.waitForDuet(id, ms, true, 20) : [];
+      const live = s.kind === "live" ? (await box.listSessions(false, 50)).find((r) => r.id === id)?.connected : null;
+      const note = replies.length ? undefined
+        : live === false ? "The window is not connected right now. It gets the message when it reconnects."
+        : "No answer yet. Call read_messages with this session_id.";
+      return text({ sent: m.id, replies, note });
+    }
+    case "read_messages": {
+      const id = str(args, "session_id", false) || null;
+      const rows = await box.waitForDuet(id, wait(args), true, int(args, "limit", 20, 50));
+      return text(rows.length ? rows : "No new messages.");
+    }
+    case "end_session": {
+      const s = await box.endSession(str(args, "session_id"));
+      if (!s) throw new ToolError("No session has that id.");
+      return text({ id: s.id, status: s.status });
+    }
+    case "open_on_mac": {
+      const id = str(args, "session_id");
+      const s = await box.getSession(id);
+      if (!s) throw new ToolError("No session has that id.");
+      if (s.kind !== "headless") throw new ToolError("That session is already a window on the Mac.");
+      if (s.status === "busy") throw new ToolError("That session is in the middle of a turn. Try again when it answers.");
+      if (s.turns === 0) throw new ToolError("That session has not finished its first turn yet, so there is nothing to open.");
+      // Mark it live first, so the Mac never runs a background turn while the window opens on the same conversation.
+      await box.registerLive(id, "", "", "");
+      const c = await box.addCommand("open_on_mac", id);
+      return text({ queued: c.id, note: "The Mac opens the window within a few seconds if it is awake." });
+    }
     default:
       throw new ToolError(`Unknown tool '${name}'.`);
   }

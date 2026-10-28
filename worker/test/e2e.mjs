@@ -117,7 +117,9 @@ check("a notification gets 202", note.status === 202, String(note.status));
 
 const list = await rpc("tools/list");
 const names = (list.result?.tools ?? []).map((t) => t.name).sort().join(",");
-check("seven tools are listed", names === "bridge_status,cancel_job,get_job,list_jobs,post_report,read_reports,send_job", names);
+check("thirteen tools are listed", names === [
+  "bridge_status", "cancel_job", "end_session", "get_job", "list_jobs", "list_sessions", "open_on_mac",
+  "post_report", "read_messages", "read_reports", "send_job", "send_message", "start_session"].join(","), names);
 
 const badWs = await tool("send_job", { title: "x", instructions: "y", workspace: "nowhere" });
 check("an unknown workspace is refused", badWs.error === true);
@@ -158,7 +160,121 @@ check("reports are marked read", again.data === "No reports.", JSON.stringify(ag
 const status = await tool("bridge_status");
 check("bridge_status shows the Mac check-in", status.data?.last_mac_checkin?.host === "e2e-mac", JSON.stringify(status));
 
-// ---- leave jobs for the Mac-side test (bin/duet-bridge.py poll) ----
+// ---- sessions: a headless conversation ----
+const work = (body = {}) => bridge("work", { method: "POST", body: JSON.stringify(body) }).then((r) => r.json());
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const badMode = await tool("start_session", { name: "x", message: "y", mode: "everything" });
+check("an unknown mode is refused", badMode.error === true);
+const started = await tool("start_session", { name: "E2E chat", message: "First question.", workspace: "default" });
+const sid = started.data?.session?.id;
+check("start_session opens a headless read session",
+  started.data?.session?.kind === "headless" && started.data?.session?.mode === "read" && !("claude_id" in started.data.session),
+  JSON.stringify(started));
+
+const t1 = await work();
+check("the Mac claims the first turn with its message",
+  t1.turn?.session?.id === sid && t1.turn.messages.length === 1 && t1.turn.messages[0].body === "First question." && Boolean(t1.turn.session.claude_id),
+  JSON.stringify(t1));
+await tool("send_message", { session_id: sid, text: "Follow-up while busy." });
+const t1b = await work({ jobs: false });
+check("a busy session is not claimed twice", !t1b.turn, JSON.stringify(t1b));
+
+await bridge(`turns/${sid}/finish`, { method: "POST", body: JSON.stringify({ ok: true, reply: "Answer one.", started: true }) });
+const r1 = await tool("read_messages", { session_id: sid });
+check("Duet reads the first answer", Array.isArray(r1.data) && r1.data[0]?.body === "Answer one.", JSON.stringify(r1));
+
+const t2 = await work();
+check("the follow-up becomes the second turn", t2.turn?.session?.turns === 1 && t2.turn.messages[0]?.body === "Follow-up while busy.", JSON.stringify(t2));
+const t0 = Date.now();
+const waiting = tool("read_messages", { session_id: sid, wait_seconds: 10 });
+await sleep(800);
+await bridge(`turns/${sid}/finish`, { method: "POST", body: JSON.stringify({ ok: true, reply: "Answer two.", started: true }) });
+const r2 = await waiting;
+check("a waiting read returns as soon as Code answers",
+  r2.data?.[0]?.body === "Answer two." && Date.now() - t0 < 5000, `${Date.now() - t0}ms ${JSON.stringify(r2)}`);
+
+// ---- sessions: a live window ----
+const wsUrl = (id) => `${BASE.replace(/^http/, "ws")}/bridge/ws?session=${id}`;
+function openWindow(id, token = TOKEN) {
+  const frames = [];
+  const ws = new WebSocket(wsUrl(id), { headers: { Authorization: `Bearer ${token}` } });
+  const ready = new Promise((resolve) => { ws.onopen = () => resolve(true); ws.onerror = () => resolve(false); });
+  ws.onmessage = (ev) => {
+    const f = JSON.parse(String(ev.data));
+    frames.push(f);
+    ws.send(JSON.stringify({ type: "ack", id: f.id }));
+  };
+  return { ws, ready, frames };
+}
+const until = async (fn, ms = 3000) => { const end = Date.now() + ms; while (!fn() && Date.now() < end) await sleep(50); return fn(); };
+
+const live = await bridge("sessions/live", { method: "POST", body: JSON.stringify({ name: "E2E window", workspace: "/tmp", focus: "testing" }) }).then((r) => r.json());
+const lid = live.session?.id;
+check("a live window registers", live.session?.kind === "live", JSON.stringify(live));
+const intruder = openWindow(lid, "wrong-token");
+check("a socket without the token is refused", (await intruder.ready) === false);
+
+const win = openWindow(lid);
+check("the window's socket opens", await win.ready);
+const listed = await tool("list_sessions");
+check("list_sessions shows the window as connected",
+  Array.isArray(listed.data) && listed.data.some((s) => s.id === lid && s.connected === true), JSON.stringify(listed));
+const tLive = Date.now();
+await tool("send_message", { session_id: lid, text: "Hello, window." });
+check("the window hears Duet within seconds", await until(() => win.frames.some((f) => f.body === "Hello, window.")), `${Date.now() - tLive}ms`);
+
+await bridge(`sessions/${lid}/messages`, { method: "POST", body: JSON.stringify({ body: "Hello, Duet." }) });
+const fromWin = await tool("read_messages", { session_id: lid });
+check("Duet reads the window's answer", fromWin.data?.[0]?.body === "Hello, Duet.", JSON.stringify(fromWin));
+
+win.ws.close();
+await sleep(300);
+await tool("send_message", { session_id: lid, text: "Sent while closed." });
+const win2 = openWindow(lid);
+await win2.ready;
+check("a message sent while the window was closed arrives on reconnect",
+  await until(() => win2.frames.some((f) => f.body === "Sent while closed.")) && !win2.frames.some((f) => f.body === "Hello, window."),
+  JSON.stringify(win2.frames));
+
+// ---- open on the Mac, end, and messages outside a session ----
+const refused = await tool("open_on_mac", { session_id: lid });
+check("open_on_mac refuses a live window", refused.error === true);
+await tool("send_message", { session_id: sid, text: "Queued before opening." });
+const opened = await tool("open_on_mac", { session_id: sid });
+check("open_on_mac queues a command", Boolean(opened.data?.queued), JSON.stringify(opened));
+const cmd = await work();
+check("the Mac gets the open command with the conversation id",
+  cmd.command?.kind === "open_on_mac" && Boolean(cmd.command.session?.claude_id), JSON.stringify(cmd));
+const afterOpen = await work({ jobs: false });
+check("an opened session gets no more background turns", !afterOpen.turn, JSON.stringify(afterOpen));
+
+const ended = await tool("end_session", { session_id: lid });
+check("end_session ends the window's session", ended.data?.status === "ended", JSON.stringify(ended));
+const late = await tool("send_message", { session_id: lid, text: "Too late." });
+check("an ended session refuses messages", late.error === true);
+win2.ws.close();
+
+const back = await bridge("sessions/live", { method: "POST", body: JSON.stringify({ id: lid, name: "E2E window", workspace: "/tmp", focus: "" }) }).then((r) => r.json());
+check("a window that comes back to an ended session gets a new one",
+  Boolean(back.session?.id) && back.session.id !== lid && back.session.status === "open", JSON.stringify(back));
+const bye = openWindow(back.session?.id);
+await bye.ready;
+bye.ws.close(1000, "window closed");
+let byeGone = false;
+for (let i = 0; i < 30 && !byeGone; i++) {
+  await sleep(100);
+  const l = await tool("list_sessions");
+  byeGone = Array.isArray(l.data) && !l.data.some((s) => s.id === back.session?.id);
+}
+check("the channel's goodbye on the line ends the session", byeGone);
+
+await bridge("messages", { method: "POST", body: JSON.stringify({ body: "Code says hi first." }) });
+const inbox = await tool("read_messages");
+check("Code can message Duet outside any session",
+  Array.isArray(inbox.data) && inbox.data.some((m) => m.body === "Code says hi first." && m.session_id === null), JSON.stringify(inbox));
+
+// ---- leave jobs for the Mac-side test (mac/duet-bridge.py poll) ----
 for (const brief of (process.env.LEAVE_JOBS ?? "").split("||").filter(Boolean)) {
   const left = await tool("send_job", { title: brief.slice(0, 60), instructions: brief, workspace: "default" });
   console.log(`  left job ${left.data.id}: ${brief.slice(0, 60)}`);

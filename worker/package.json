@@ -1,7 +1,7 @@
 {
   "name": "duet-bridge",
-  "version": "1.0.0",
-  "description": "Cloud mailbox connector between Claude Duet and Claude Code on the Mac",
+  "version": "2.0.0",
+  "description": "Cloud mailbox connector between Claude Duet and Claude Code on your Mac",
   "scripts": {
     "dev": "rm -rf .wrangler/e2e-state && wrangler dev --local-protocol https --port 8787 --persist-to .wrangler/e2e-state",
     "test": "node test/e2e.mjs",

@@ -1,3 +1,7 @@
-mac/config.toml
-mac/OFF
 .DS_Store
+node_modules/
+.wrangler/
+.dev.vars
+mac/config.toml
+mac/duet-bridge.OFF
+mac/OFF
