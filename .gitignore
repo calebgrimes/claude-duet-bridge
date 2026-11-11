@@ -1,7 +1,11 @@
 .DS_Store
+__pycache__/
 node_modules/
 .wrangler/
 .dev.vars
 mac/config.toml
 mac/duet-bridge.OFF
 mac/OFF
+windows/config.toml
+windows/duet-bridge.OFF
+windows/OFF
