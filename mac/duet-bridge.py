@@ -54,6 +54,16 @@ DEFAULT_DENIED = [
     "SendMessage", "CronCreate", "CronDelete", "RemoteTrigger", "ScheduleWakeup", "Workflow",
     "PushNotification", "SendUserFile", "Skill", "EnterWorktree", "Monitor",
 ]
+# Session turns run as background sessions (claude --bg), so they show in your agent view (`claude agents`).
+# --bg picks its own conversation id, so this file maps the bridge's claude_id to it.
+BG_MAP = CONFIG_FILE.parent / "duet-bg-sessions.json"
+# A background session does not inherit the runner's environment, so these also go in --settings "env".
+# Without it, the claude.ai connectors (Gmail and the rest) load in background sessions.
+RUN_ENV = {**CFG.get("job_env", {}), "ENABLE_CLAUDEAI_MCP_SERVERS": "false"}
+# A background session saves its options, including this path, so it must outlive the turn.
+MCP_FILE = CONFIG_FILE.parent / "duet-mcp-readonly.json"
+BG_POLL_SECS = 5
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 AUTH_FAILURE = re.compile(r"invalid api key|please run .?/login|oauth token|authentication_error|credit balance", re.I)
 
@@ -131,24 +141,25 @@ def mcp_config() -> dict:
     return {"mcpServers": servers}
 
 
+def with_mcp(args: list[str]) -> list[str]:
+    """Add the read-only server set when the flags ask for it."""
+    if "--strict-mcp-config" not in args:
+        return args
+    with tempfile.NamedTemporaryFile("w", suffix=".json", dir=MCP_FILE.parent, delete=False) as f:
+        json.dump(mcp_config(), f)
+    os.replace(f.name, MCP_FILE)  # atomic, because two turns can write it at once
+    return ["--mcp-config", str(MCP_FILE), *args]
+
+
 def run_claude(args: list[str], prompt: str, cwd: Path, timeout: int, label: str) -> tuple[int, str, str]:
     """Run `claude -p` with the read-only server set when asked. Returns (rc, stdout, stderr); rc -1 is a timeout."""
     # claude.ai connectors stay out of runs; [job_env] can add variables your own hooks read.
-    env = {**os.environ, **CFG.get("job_env", {}), "ENABLE_CLAUDEAI_MCP_SERVERS": "false"}
-    mcp_file = None
-    if "--strict-mcp-config" in args:
-        with tempfile.NamedTemporaryFile("w", suffix=".json", prefix="duet-mcp-", delete=False) as f:
-            json.dump(mcp_config(), f)
-            mcp_file = f.name
-        args = ["--mcp-config", mcp_file, *args]
     try:
-        proc = subprocess.run([CLAUDE, "-p", *args], input=prompt, capture_output=True, text=True,
-                              cwd=cwd, env=env, timeout=timeout)
+        proc = subprocess.run([CLAUDE, "-p", "--output-format", "text", *with_mcp(args)], input=prompt,
+                              capture_output=True, text=True, cwd=cwd, env={**os.environ, **RUN_ENV},
+                              timeout=timeout)
     except subprocess.TimeoutExpired:
         return -1, "", f"stopped after {timeout} seconds"
-    finally:
-        if mcp_file:
-            os.unlink(mcp_file)
     out = proc.stdout.strip()
     # Full output goes to the log, never a truncated head.
     log(f"{label} rc={proc.returncode} bytes={len(out)}\n----- output -----\n{out}\n----- stderr -----\n{proc.stderr.strip()}\n----- end -----")
@@ -168,8 +179,8 @@ def judge(rc: int, out: str, err: str, timeout: int) -> tuple[bool, str]:
 def read_only_flags(rules: str) -> list[str]:
     return [
         "--model", CFG.get("model", "opus"),
-        "--output-format", "text",
         "--permission-mode", "dontAsk",
+        "--settings", json.dumps({"env": RUN_ENV}),
         "--strict-mcp-config",
         "--allowedTools", *CFG.get("allowed_tools", DEFAULT_ALLOWED),
         "--disallowedTools", *CFG.get("denied_tools", DEFAULT_DENIED),
@@ -182,8 +193,10 @@ def work_flags() -> list[str]:
     # The claude.ai connectors (Gmail and the rest) stay off.
     return [
         "--model", CFG.get("model", "opus"),
-        "--output-format", "text",
         "--permission-mode", "auto",
+        # Nobody is at the desk to approve, so a step that would wait is refused and the turn goes on.
+        # Only on this command line, so your own windows (and open_on_mac takeovers) still ask you.
+        "--settings", json.dumps({"permissions": {"denyInsteadOfPrompting": True}, "env": RUN_ENV}),
         "--disallowedTools", *CFG.get("work_denied_tools", []),
         "--append-system-prompt", WORK_RULES,
     ]
@@ -210,8 +223,152 @@ def do_job(job: dict) -> None:
 
 # ---- session turns ----
 
+def transcript(sid: str) -> Path | None:
+    return next(PROJECTS.glob(f"*/{sid}.jsonl"), None)
+
+
+def bg_map() -> dict:
+    try:
+        return json.loads(BG_MAP.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def conv_id(claude_id: str) -> str:
+    """The conversation a bridge session runs in: its background session, else the id it was made with."""
+    return bg_map().get(claude_id, claude_id)
+
+
 def conversation_exists(claude_id: str) -> bool:
-    return any(PROJECTS.glob(f"*/{claude_id}.jsonl"))
+    return transcript(conv_id(claude_id)) is not None
+
+
+def remember_bg(claude_id: str, sid: str) -> None:
+    with _log_lock:
+        m = bg_map()
+        m[claude_id] = sid
+        BG_MAP.write_text(json.dumps(m, indent=1))
+
+
+def find_agent(sid: str, key: str = "sessionId") -> dict | None:
+    """A row of `claude agents`, stopped sessions included. A running one has a pid."""
+    r = subprocess.run([CLAUDE, "agents", "--json", "--all"], capture_output=True, text=True, timeout=60)
+    try:
+        rows = json.loads(r.stdout or "[]")
+    except ValueError:
+        return None
+    return next((a for a in rows if a.get(key) == sid), None)
+
+
+def final_text(path: Path, offset: int) -> str:
+    """The last answer written after offset: the text after the last tool call, like `claude -p` prints."""
+    parts: list[str] = []
+    with path.open() as f:
+        f.seek(offset)
+        for line in f:
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if r.get("type") == "user" and isinstance(r.get("message", {}).get("content"), str):
+                parts = []  # a new prompt: only the answer to the last one counts
+            if r.get("type") != "assistant" or r.get("isSidechain"):
+                continue
+            for b in r["message"].get("content") or []:
+                if b.get("type") == "tool_use":
+                    parts = []
+                elif b.get("type") == "text" and b.get("text", "").strip():
+                    parts.append(b["text"])
+    return "\n\n".join(parts).strip()
+
+
+def stop_bg(a: dict | None) -> None:
+    """Stop a running background session and wait until it is gone. `claude stop` returns before it exits."""
+    if not (a and a.get("pid") and a.get("kind") == "background"):  # never one of your own windows
+        return
+    subprocess.run([CLAUDE, "stop", a["id"]], capture_output=True, text=True, timeout=60)
+    for _ in range(30):
+        b = find_agent(a["sessionId"])
+        try:
+            os.kill(a["pid"], 0)  # the row can lose its pid before the process exits
+        except ProcessLookupError:
+            if not (b and b.get("pid")):
+                return
+        except PermissionError:
+            pass
+        time.sleep(1)
+    log(f"stop_bg: session {a['id']} still runs 30 s after stop")
+
+
+def stop_quiet_sessions() -> None:
+    """Stop Duet background sessions quiet for bg_idle_hours. Each idle one holds about 300 MB.
+    A stopped one leaves the agent view; the next Duet message wakes it."""
+    cutoff = time.time() - float(CFG.get("bg_idle_hours", 8)) * 3600
+    for sid in set(bg_map().values()):
+        path = transcript(sid)
+        if path and path.stat().st_mtime < cutoff:
+            a = find_agent(sid)
+            if a and a.get("pid") and a.get("status") == "idle":
+                stop_bg(a)
+                log(f"stopped quiet background session {a['id']} ({a.get('name')})")
+
+
+def run_bg_turn(claude_id: str, name: str, flags: list[str], prompt: str, cwd: Path, timeout: int,
+                label: str) -> tuple[int, str, str]:
+    """One turn as a background session, which stays in the agent view, idle, after it answers."""
+    known = claude_id in bg_map()
+    sid = conv_id(claude_id) if known or transcript(claude_id) else None
+    cmd = [CLAUDE, "--bg"]
+    if sid:
+        a = find_agent(sid)
+        if a and a.get("status") == "busy":
+            return 1, "", "This session is busy on the Mac right now (the user may be working in it). Try again later."
+        stop_bg(a)  # a running session would answer --resume with a copy
+        cmd += ["--resume", sid]
+        if a is None:
+            # A conversation from before background sessions takes the flags once. After that it keeps its own,
+            # and any flag on --resume makes a copy instead.
+            cmd += ["--name", name, *with_mcp(flags)]
+    else:
+        cmd += ["--name", name, *with_mcp(flags)]
+    path = transcript(sid) if sid else None
+    offset = path.stat().st_size if path else 0
+    r = subprocess.run([*cmd, "--", prompt], capture_output=True, text=True, cwd=cwd, timeout=120)
+    said = (r.stdout + r.stderr).strip()
+    m = re.search(r"backgrounded · (\w+)", said)
+    if r.returncode or not m:
+        log(f"{label} could not start a background session rc={r.returncode}\n{said}")
+        return r.returncode or 1, "", said
+    a = find_agent(m.group(1), key="id")
+    if a is None:
+        return 1, "", f"Claude Code started session {m.group(1)} but does not list it. {said}"
+    if a["sessionId"] != sid:  # new, or Claude Code made a copy: follow the session that really runs
+        if sid:
+            log(f"{label} note: Claude Code made a copy {a['id']} of {sid}; following the copy. {said}")
+            offset = 0
+        sid = a["sessionId"]
+        remember_bg(claude_id, sid)
+    log(f"{label} running as background session {a['id']} ({sid}). {said.splitlines()[0] if said else ''}")
+    deadline, empty_idle = time.time() + timeout, 0
+    while time.time() < deadline:
+        time.sleep(BG_POLL_SECS)
+        a = find_agent(sid) or (time.sleep(BG_POLL_SECS) or find_agent(sid))  # one bad read is not a dead session
+        if a is None or a.get("state") == "failed" or (not a.get("pid") and a.get("state") != "done"):
+            logs = subprocess.run([CLAUDE, "logs", sid[:8]], capture_output=True, text=True, timeout=60)
+            err = ANSI.sub("", logs.stdout + logs.stderr)[-1500:]
+            log(f"{label} background session ended badly: {a}\n{err}")
+            return 1, "", f"The background session stopped ({(a or {}).get('state', 'gone')}). {err}"
+        if a.get("status") == "busy":
+            empty_idle = 0
+            continue
+        path = transcript(sid)
+        out = final_text(path, offset) if path else ""
+        if out or empty_idle >= 3:  # idle three times with no answer: it ended without one
+            log(f"{label} rc=0 bytes={len(out)}\n----- output -----\n{out}\n----- end -----")
+            return 0, out, ""
+        empty_idle += 1
+    stop_bg(find_agent(sid))
+    return -1, "", f"stopped after {timeout} seconds"
 
 
 def run_turn(session: dict, messages: list[dict]) -> tuple[bool, str, bool]:
@@ -221,7 +378,8 @@ def run_turn(session: dict, messages: list[dict]) -> tuple[bool, str, bool]:
         return False, f"The Mac has no folder for workspace '{session['workspace']}'.", False
     claude_id = session["claude_id"]
     if len(messages) == 1:
-        prompt = messages[0]["body"]
+        # The label also keeps a message that starts with "!" or "/" from running as a shell line or a command.
+        prompt = "Message from Duet:\n\n" + messages[0]["body"]
     else:
         prompt = "Duet sent these messages since your last answer:\n\n" + "\n\n".join(
             f"[{i}] {m['body']}" for i, m in enumerate(messages, 1))
@@ -230,9 +388,8 @@ def run_turn(session: dict, messages: list[dict]) -> tuple[bool, str, bool]:
     work = session["mode"] == "work"
     flags = work_flags() if work else read_only_flags(JOB_RULES)
     timeout = int(CFG.get("work_timeout_secs" if work else "timeout_secs", 3600 if work else 1800))
-    resume = session["turns"] > 0 or conversation_exists(claude_id)
-    which = ["--resume", claude_id] if resume else ["--session-id", claude_id, "--name", f"duet: {session['name']}"]
-    rc, out, err = run_claude([*which, *flags], prompt, cwd, timeout, f"turn {session['id']} #{session['turns'] + 1}")
+    rc, out, err = run_bg_turn(claude_id, f"duet: {session['name']}", flags, prompt, cwd, timeout,
+                               f"turn {session['id']} #{session['turns'] + 1}")
     ok, reply = judge(rc, out, err, timeout)
     return ok, reply, conversation_exists(claude_id)
 
@@ -255,10 +412,12 @@ def open_on_mac(session: dict) -> None:
     if cwd is None or not session.get("claude_id"):
         log(f"open_on_mac {session['id']}: no folder or no conversation; skipped")
         return
+    sid = conv_id(session["claude_id"])
+    stop_bg(find_agent(sid))  # the window takes over the background session, so only one copy writes to it
     # --dir, because a terminal may start the command in another folder, and --resume finds a conversation by folder.
     # --name keeps the session's name; without it the window renames the session after its folder.
     code = [str(HERE / "duet-code"), "--dir", str(cwd), "--session", session["id"],
-            "--name", session.get("name") or "Duet session", "--resume", session["claude_id"]]
+            "--name", session.get("name") or "Duet session", "--resume", sid]
     if OPENER:
         subprocess.run([OPENER, str(cwd), *code], check=False, timeout=30)
         log(f"open_on_mac {session['id']}: opened in {cwd}")
@@ -353,8 +512,15 @@ def cmd_serve(_args) -> int:
     pool = ThreadPoolExecutor(max_workers=width)
     running: set = set()
     log(f"serve: started (up to {width} at a time, every {pause:g}s)")
+    next_sweep = 0.0
     while True:
         running = {f for f in running if not f.done()}
+        if time.time() > next_sweep:
+            next_sweep = time.time() + 600
+            try:
+                stop_quiet_sessions()
+            except Exception as e:  # the sweep must never stop the bridge
+                log(f"serve: quiet-session sweep failed: {e}")
         if OFF_FILE.exists():
             time.sleep(30)
             continue
