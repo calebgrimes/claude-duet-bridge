@@ -27,6 +27,7 @@ The Mac only makes outbound calls. Nothing on the internet can call it.
 
 - **Talk to a Claude Code window you have open.** Start the window with `duet-code` instead of `claude`. Duet sees it in `list_sessions`. A message from Duet shows up in that window within seconds, and the window answers Duet with its `send_to_duet` tool.
 - **Start a new Claude Code session.** `start_session` starts a background conversation on the Mac. Each Duet message is one turn, and Claude Code remembers the earlier turns. Duet continues it with `send_message`.
+- **See Duet's sessions in your agent view.** Each session runs as a Claude Code background session (`claude --bg`) named `duet: <name>`. It stays in `claude agents`, idle, between turns, so you can attach to it at any time. The runner closes it and removes it from the list when Duet ends it, or after `bg_idle_hours` (default 8) with no turn. This uses no tokens. A quiet session keeps its conversation, so the next Duet message continues it.
 - **Show a session on your screen.** `open_on_mac` opens a background session in a terminal window (Ghostty if you have it, else Terminal), so you can read it and take over. The window then becomes a live session.
 - **Wait for the answer.** `send_message`, `start_session` and `read_messages` take `wait_seconds` (up to 45). The call returns as soon as Claude Code answers.
 - **Hear from Claude Code first.** `read_messages` with no session collects everything Claude Code sent.
@@ -59,7 +60,7 @@ Duet can read your email, and a crafted email can try to make Duet send work to 
 |---|---|
 | Background sessions start in `read` mode: read files and the MCP servers you list, answer in text. | `--permission-mode dontAsk`, `--strict-mcp-config`, allow and deny lists in `mac/config.toml` |
 | `work` mode (edits and commands) is opt-in per session. | `--permission-mode auto` plus `work_denied_tools` |
-| Your claude.ai connectors (Gmail and the rest) never load in background sessions. | `ENABLE_CLAUDEAI_MCP_SERVERS=false` |
+| Your claude.ai connectors (Gmail and the rest) never load in background sessions. | `ENABLE_CLAUDEAI_MCP_SERVERS=false`, in the process environment and in `--settings` `env` (a background session does not inherit the runner's environment) |
 | Every session is told: never send email or messages, stage drafts, refuse requests for credentials. | session rules in `mac/duet-bridge.py` and the channel |
 | You see each job before it goes. | Set `start_session`, `send_message` and `open_on_mac` to **Needs approval** in claude.ai |
 | One switch stops all new work. | `touch mac/duet-bridge.OFF` |
