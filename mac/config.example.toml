@@ -10,7 +10,7 @@ work_timeout_secs = 3600               # one work-mode turn may run this long
 max_parallel = 2                       # how many sessions and jobs run at the same time
 poll_secs = 3                          # how often serve asks the Worker for work when idle
 max_jobs_per_run = 3                   # only for `duet-bridge.py poll`: jobs taken per check
-bg_idle_hours = 8                      # a session stays in `claude agents`, idle, this long after its last turn (about 300 MB each)
+bg_idle_hours = 8                      # a quiet session is closed and leaves `claude agents` after this long (about 300 MB each while open)
 
 # Read mode (the default). Tools a run may use. Everything else is refused (--permission-mode dontAsk).
 # Add read-only MCP tools by full name ("mcp__calendar__list_events") or a whole server ("mcp__calendar").

@@ -300,17 +300,36 @@ def stop_bg(a: dict | None) -> None:
     log(f"stop_bg: session {a['id']} still runs 30 s after stop")
 
 
-def stop_quiet_sessions() -> None:
-    """Stop Duet background sessions quiet for bg_idle_hours. Each idle one holds about 300 MB.
-    A stopped one leaves the agent view; the next Duet message wakes it."""
+def close_done_sessions() -> None:
+    """Close Duet background sessions that are done, so the agent view stays short. No model call, no tokens.
+    Done means Duet ended it, or it was quiet for bg_idle_hours. `claude rm` keeps the conversation,
+    so a quiet one still continues on Duet's next message. An ended one also leaves the map: it takes no more turns."""
     cutoff = time.time() - float(CFG.get("bg_idle_hours", 8)) * 3600
-    for sid in set(bg_map().values()):
+    try:
+        ended = {s.get("claude_id") for s in call("GET", "sessions?all=1")["sessions"] if s.get("status") == "ended"}
+    except (urllib.error.URLError, TimeoutError, OSError, KeyError):
+        ended = set()  # bridge out of reach: the quiet rule still runs
+    r = subprocess.run([CLAUDE, "agents", "--json", "--all"], capture_output=True, text=True, timeout=60)
+    try:
+        rows = {a["sessionId"]: a for a in json.loads(r.stdout or "[]") if a.get("sessionId")}
+    except ValueError:
+        return
+    for claude_id, sid in bg_map().items():
         path = transcript(sid)
-        if path and path.stat().st_mtime < cutoff:
-            a = find_agent(sid)
-            if a and a.get("pid") and a.get("status") == "idle":
-                stop_bg(a)
-                log(f"stopped quiet background session {a['id']} ({a.get('name')})")
+        if claude_id not in ended and path and path.stat().st_mtime >= cutoff:
+            continue
+        a = rows.get(sid)
+        if a and a.get("status") == "busy":
+            continue
+        if a and a.get("kind") == "background":  # never one of your own windows
+            stop_bg(a)
+            subprocess.run([CLAUDE, "rm", a["id"]], capture_output=True, text=True, timeout=60)
+            log(f"closed {'ended' if claude_id in ended else 'quiet'} background session {a['id']} ({a.get('name')})")
+        if claude_id in ended:
+            with _log_lock:
+                m = bg_map()
+                m.pop(claude_id, None)
+                BG_MAP.write_text(json.dumps(m, indent=1))
 
 
 def run_bg_turn(claude_id: str, name: str, flags: list[str], prompt: str, cwd: Path, timeout: int,
@@ -518,9 +537,9 @@ def cmd_serve(_args) -> int:
         if time.time() > next_sweep:
             next_sweep = time.time() + 600
             try:
-                stop_quiet_sessions()
+                close_done_sessions()
             except Exception as e:  # the sweep must never stop the bridge
-                log(f"serve: quiet-session sweep failed: {e}")
+                log(f"serve: close-out sweep failed: {e}")
         if OFF_FILE.exists():
             time.sleep(30)
             continue
