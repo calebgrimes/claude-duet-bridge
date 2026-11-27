@@ -1,4 +1,5 @@
 .DS_Store
+__pycache__/
 node_modules/
 .wrangler/
 .dev.vars
@@ -7,3 +8,6 @@ mac/duet-bridge.OFF
 mac/duet-bg-sessions.json
 mac/duet-mcp-readonly.json
 mac/OFF
+windows/config.toml
+windows/duet-bridge.OFF
+windows/OFF

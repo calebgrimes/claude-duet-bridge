@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Duet Bridge runner: the Mac side of the line between Claude Duet and Claude Code.
+"""Duet Bridge runner: the computer's side of the line between Claude Duet and Claude Code.
+
+Runs on macOS and on Windows. The platform only changes how a window is opened and where
+the log and config live; everything else is the same on both.
 
   duet-bridge.py serve                    stay on: run Duet's sessions, jobs and open-window requests
   duet-bridge.py poll                     one pass over the queue, then exit (the old 5-minute mode)
@@ -11,16 +14,18 @@
   duet-bridge.py status                   counts, open live windows, last check-in
   duet-bridge.py jobs [--status queued]   list jobs
 
-launchd keeps `serve` running (see install.sh).
+`serve` is kept running by launchd on macOS (mac/install.sh) and by a scheduled task on
+Windows (windows/install.ps1).
 Kill switch: create a file named duet-bridge.OFF next to config.toml and nothing new starts until it is removed.
-Live windows: duet-code, in this folder. Settings: config.toml next to this script (copy config.example.toml),
-or the file named in DUET_BRIDGE_CONFIG. The Worker: ../worker/.
+Live windows: mac/duet-code, or windows/duet-code.ps1. Settings: config.toml beside this script on macOS,
+windows/config.toml on Windows, or the file named in DUET_BRIDGE_CONFIG. The Worker: ../worker/.
 """
 import argparse
 import json
 import os
 import re
 import shlex
+import shutil
 import socket
 import ssl
 import subprocess
@@ -36,21 +41,29 @@ from datetime import datetime
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-CONFIG_FILE = Path(os.environ.get("DUET_BRIDGE_CONFIG") or HERE / "config.toml").expanduser()
+REPO = HERE.parent
+IS_WINDOWS = sys.platform == "win32"
+# Windows keeps its own config next to its launchers, so each platform has its own
+# settings and its own OFF switch even when both live in one checkout.
+DEFAULT_CONFIG = REPO / "windows" / "config.toml" if IS_WINDOWS else HERE / "config.toml"
+CONFIG_FILE = Path(os.environ.get("DUET_BRIDGE_CONFIG") or DEFAULT_CONFIG).expanduser()
 CFG = tomllib.loads(CONFIG_FILE.read_text()) if CONFIG_FILE.exists() else {}
 URL = (os.environ.get("DUET_BRIDGE_URL") or CFG.get("url", "")).rstrip("/")
 TOKEN_FILE = Path(os.environ.get("DUET_BRIDGE_TOKEN_FILE") or CFG.get("token_file", "~/.duet-bridge-token")).expanduser()
 OFF_FILE = CONFIG_FILE.parent / "duet-bridge.OFF"
-LOG = Path(CFG.get("log_file", "~/Library/Logs/duet-bridge.log")).expanduser()
+DEFAULT_LOG = "~/AppData/Local/duet-bridge/duet-bridge.log" if IS_WINDOWS else "~/Library/Logs/duet-bridge.log"
+LOG = Path(CFG.get("log_file") or DEFAULT_LOG).expanduser()
 # Tests point these at stand-ins.
 CLAUDE = os.environ.get("DUET_BRIDGE_CLAUDE", "claude")
 OPENER = os.environ.get("DUET_BRIDGE_OPENER", "")
 PROJECTS = Path(os.environ.get("DUET_BRIDGE_PROJECTS", "~/.claude/projects")).expanduser()
 
 DEFAULT_ALLOWED = ["Read", "Glob", "Grep"]
+# Keep a read-only run out of the OS's own per-user data: ~/Library on macOS, ~/AppData on Windows.
+PRIVATE_HOME = ["Read(~/AppData/**)"] if IS_WINDOWS else ["Read(~/Library/**)"]
 DEFAULT_DENIED = [
     "Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch", "Agent", "Task",
-    "Read(~/.*)", "Read(~/.*/**)", "Read(~/Library/**)",
+    "Read(~/.*)", "Read(~/.*/**)", *PRIVATE_HOME,
     "SendMessage", "CronCreate", "CronDelete", "RemoteTrigger", "ScheduleWakeup", "Workflow",
     "PushNotification", "SendUserFile", "Skill", "EnterWorktree", "Monitor",
 ]
@@ -282,6 +295,21 @@ def final_text(path: Path, offset: int) -> str:
     return "\n\n".join(parts).strip()
 
 
+def alive(pid: int) -> bool:
+    """True while the process runs. On Windows, os.kill(pid, 0) sends Ctrl+C, so ask tasklist instead."""
+    if IS_WINDOWS:
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
+                             capture_output=True, text=True, timeout=30).stdout
+        return f'"{pid}"' in out
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
 def stop_bg(a: dict | None) -> None:
     """Stop a running background session and wait until it is gone. `claude stop` returns before it exits."""
     if not (a and a.get("pid") and a.get("kind") == "background"):  # never one of your own windows
@@ -289,13 +317,8 @@ def stop_bg(a: dict | None) -> None:
     subprocess.run([CLAUDE, "stop", a["id"]], capture_output=True, text=True, timeout=60)
     for _ in range(30):
         b = find_agent(a["sessionId"])
-        try:
-            os.kill(a["pid"], 0)  # the row can lose its pid before the process exits
-        except ProcessLookupError:
-            if not (b and b.get("pid")):
-                return
-        except PermissionError:
-            pass
+        if not alive(a["pid"]) and not (b and b.get("pid")):  # the row can lose its pid before the process exits
+            return
         time.sleep(1)
     log(f"stop_bg: session {a['id']} still runs 30 s after stop")
 
@@ -435,16 +458,45 @@ def open_on_mac(session: dict) -> None:
     stop_bg(find_agent(sid))  # the window takes over the background session, so only one copy writes to it
     # --dir, because a terminal may start the command in another folder, and --resume finds a conversation by folder.
     # --name keeps the session's name; without it the window renames the session after its folder.
-    code = [str(HERE / "duet-code"), "--dir", str(cwd), "--session", session["id"],
+    launcher = REPO / "windows" / "duet-code.ps1" if IS_WINDOWS else HERE / "duet-code"
+    code = [str(launcher), "--dir", str(cwd), "--session", session["id"],
             "--name", session.get("name") or "Duet session", "--resume", sid]
     if OPENER:
         subprocess.run([OPENER, str(cwd), *code], check=False, timeout=30)
         log(f"open_on_mac {session['id']}: opened in {cwd}")
         return
-    if ghostty_installed():
+    if IS_WINDOWS:
+        open_in_windows_terminal(session, cwd, code)
+    elif ghostty_installed():
         open_in_ghostty(session, cwd, code)
     else:
         open_in_terminal(session, cwd, code)
+
+
+def ps_quote(value: str) -> str:
+    """One PowerShell single-quoted literal, so a path with spaces or quotes survives the trip."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def open_in_windows_terminal(session: dict, cwd: Path, code: list[str]) -> None:
+    """Windows: a new Windows Terminal window, or a console of its own when wt is not installed."""
+    shell = shutil.which("pwsh") or shutil.which("powershell") or "powershell"
+    # The whole launcher call goes in one -Command string: wt would otherwise try to read
+    # --dir and --session as its own options.
+    inner = "& " + " ".join(ps_quote(a) for a in code)
+    run = [shell, "-NoLogo", "-NoExit", "-ExecutionPolicy", "Bypass", "-Command", inner]
+    wt = shutil.which("wt")
+    if wt:
+        # -w -1 asks for a new window instead of a tab in whichever one has focus.
+        try:
+            subprocess.run([wt, "-w", "-1", "new-tab", "-d", str(cwd), *run],
+                           check=True, capture_output=True, timeout=30)
+            log(f"open_on_mac {session['id']}: opened in {cwd} (Windows Terminal)")
+            return
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
+            log(f"open_on_mac {session['id']}: Windows Terminal failed ({e}); using a console window")
+    subprocess.Popen(run, cwd=str(cwd), creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+    log(f"open_on_mac {session['id']}: opened in {cwd} (console window)")
 
 
 def ghostty_installed() -> bool:
