@@ -5,6 +5,8 @@ node_modules/
 .dev.vars
 mac/config.toml
 mac/duet-bridge.OFF
+mac/duet-bg-sessions.json
+mac/duet-mcp-readonly.json
 mac/OFF
 windows/config.toml
 windows/duet-bridge.OFF
